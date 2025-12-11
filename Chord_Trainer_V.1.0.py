@@ -3,7 +3,71 @@ from tkinter import ttk
 import random
 import time
 import threading
-import winsound
+import os 
+import sys
+import pygame.mixer 
+import io # <-- NEW: Needed if we were using BytesIO, but good practice.
+
+# --- ROBUST PATH RESOLUTION FOR ALL MODES ---
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    
+    # 1. Check if the script is running inside a PyInstaller bundle
+    if getattr(sys, 'frozen', False):
+        # PyInstaller Mode (.exe): sys._MEIPASS is the temporary directory
+        base_path = sys._MEIPASS
+    else:
+        # Development Mode (.py): Use the directory where the script lives
+        try:
+            # The most reliable way to get the script's directory
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            # Fallback for some strange environments
+            base_path = os.getcwd()
+
+    # Use os.path.join for OS-independent path construction
+    return os.path.join(base_path, relative_path)
+
+# --- CONFIGURATION: Sound File Path (Matches your PyInstaller command) ---
+SOUND_FILE_NAME = "Simple_drumsound.wav" 
+STRONG_CLICK_FILE = resource_path(SOUND_FILE_NAME) 
+
+# --- GLOBAL AUDIO OBJECT ---
+SOUND_OBJECT = None 
+
+# SUGGESTION: MODIFIED load_audio_file to load from a file handle
+def load_audio_file():
+    """Initializes Pygame mixer and loads the sound from a file handle for robustness."""
+    global SOUND_OBJECT
+    try:
+        # 1. Initialize the mixer (Crucial Step 1)
+        pygame.mixer.init() 
+        
+        # 2. Open the file in binary read mode ('rb')
+        with open(STRONG_CLICK_FILE, 'rb') as f:
+            # 3. Load the file content into Pygame from the open file handle (stream)
+            # This is significantly more robust than passing a path string to the EXE.
+            SOUND_OBJECT = pygame.mixer.Sound(f) 
+        
+        print("Audio loaded successfully.")
+    except Exception as e:
+        # If the file path is wrong inside the EXE, or Pygame failed to initialize
+        print(f"ERROR: Audio setup failed in EXE mode. Check path: {STRONG_CLICK_FILE}. Error: {e}")
+        SOUND_OBJECT = None
+        
+def play_audio_non_blocking():
+    """Plays the loaded wave object asynchronously."""
+    global SOUND_OBJECT
+    if SOUND_OBJECT:
+        try:
+            # The play() method is non-blocking
+            SOUND_OBJECT.play() 
+        except Exception as e:
+            # This typically catches issues if the sound card disconnects, etc.
+            print(f"Error playing sound: {e}")
+
+# --- CHORD GENERATION LOGIC (UNCHANGED) ---
 
 simple_chords_revised = {
     'A': 'A Major', 'Am': 'A minor', 'Asus2': 'A sus2', 'Asus4': 'A sus4', 
@@ -112,7 +176,7 @@ current_beat = 0
 
 # Initial chord setup
 last_chord = generate_chord_different_from("INIT") 
-previous_chord = ""                               
+previous_chord = "" 
 next_chord = generate_chord_different_from(last_chord) 
 
 audio_enabled = False 
@@ -138,10 +202,10 @@ style.theme_use('default')
 SLIDER_STYLE_NAME = "Dark.Horizontal.TScale"
 style.configure(SLIDER_STYLE_NAME,
     background="#1e1e1e",
-    troughcolor="#555555",      
-    sliderrelief="raised",      
-    sliderthickness=25,         
-    groovethickness=8           
+    troughcolor="#555555", 
+    sliderrelief="raised", 
+    sliderthickness=25,  
+    groovethickness=8 
 )
 style.map(SLIDER_STYLE_NAME, 
     background=[('active', '#00ff00'), ('!disabled', '#BBBBBB')], 
@@ -226,14 +290,47 @@ bpm_slider.set(current_bpm)
 bpm_slider.pack(pady=5)
 
 
-# --- BUTTON FUNCTIONS and AUDIO LOGIC ---
+# --- AUDIO SYNCHRONIZATION AND CONTROL FUNCTIONS ---
+
+def sync_audio_state():
+    """Calculates and sets which beats should have ALREADY played based on the current timer_ms. 
+    This is called when audio is turned ON to prevent immediate firing of missed beats."""
+    global audio_beats_played, timer_ms, time_per_beat_s
+
+    if time_per_beat_s == 0:
+        return
+
+    audio_beats_played.clear()
+    beat_duration_ms = time_per_beat_s * 1000
+    AUDIO_ANTICIPATION_MS = 60 # Same as in check_audio_anticipation
+
+    # We iterate through all beats and check if they *should* have been played by now.
+    for beat in range(1, BEATS_PER_CHORD + 1):
+        target_start_ms = (beat - 1) * beat_duration_ms
+        
+        # The beat is considered "played" if the current timer_ms is past its 
+        # anticipated trigger point.
+        anticipation_start_ms = target_start_ms - AUDIO_ANTICIPATION_MS
+        
+        # We add a small buffer (e.g., half the update interval) 
+        # to prevent race conditions right on the boundary.
+        if timer_ms >= anticipation_start_ms:
+            audio_beats_played.add(beat)
+
 def toggle_audio():
+    """
+    Toggles audio ON/OFF and synchronizes the audio state when turning ON
+    to prevent immediate, out-of-sync playback of missed beats.
+    """
     global audio_enabled
     audio_enabled = not audio_enabled
     if audio_enabled:
         audio_button.config(text="Sound ON", bg="#008800")
+        # Synchronization: Fill audio_beats_played with beats that already passed.
+        sync_audio_state() 
     else:
         audio_button.config(text="Sound OFF", bg="#880000")
+        audio_beats_played.clear() # Clear state when off
         
 def toggle_pause():
     global paused
@@ -246,21 +343,13 @@ def skip_chord():
         toggle_pause() 
     refresh_chord()
 
-def play_audio_sync(file_path):
-    try:
-        winsound.PlaySound(file_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-    except Exception as e:
-        print(f"Error playing sync sound via winsound: {e}")
-
 def play_beat_click(beat_number):
-    STRONG_CLICK_FILE = "Simple_beat.wav"
-    file_to_play = STRONG_CLICK_FILE 
-    threading.Thread(target=play_audio_sync, args=(file_to_play,)).start()
+    play_audio_non_blocking()
 
 def reset_progress():
     global timer_ms, current_beat, audio_beats_played
     timer_ms = 0
-    current_beat = 1  
+    current_beat = 1 
     audio_beats_played.clear() 
     update_lights()
 
@@ -283,6 +372,7 @@ def refresh_chord():
     reset_progress()
     
     if audio_enabled:
+        # This explicit call is needed to ensure the beat fires *instantly* # on a chord change (manual skip or auto-advance)
         play_beat_click(1)
         audio_beats_played.add(1)
     
@@ -355,7 +445,7 @@ timer_ms = 0
 
 def update_lights():
     global current_beat
-    beat_colors = { 1: "yellow", 2: "yellow", 3: "yellow", 4: "red" }
+    beat_colors = { 1: "green", 2: "white", 3: "white", 4: "yellow" }
     for i, light in enumerate(metronome_lights):
         beat_number = i + 1 
         if beat_number <= current_beat:
@@ -385,13 +475,14 @@ def update_timer_and_progress():
 
 # --- START APPLICATION ---
 
+# The robust loading function must be called here
+load_audio_file() 
+
 # The very first chord needs to be generated before the first refresh
-# To maintain the previous="" state for the first real 'refresh_chord'
 last_chord = generate_chord_different_from("INIT_CHORD") 
 next_chord = generate_chord_different_from(last_chord)
 
 # Manually update labels for the true initial state before the timer starts
-# We use an empty string for the first previous chord
 previous_chord_label.config(text="") 
 current_chord_label.config(text=last_chord)
 next_chord_label.config(text=next_chord)
